@@ -3,39 +3,33 @@ Class Lab.Instrument.Order Extends %Persistent
     Property OrderId As %String;
     Property PatientId As %String;
     Property OrderDate As %String;
-    Property TestCodes As %ListOfDataTypes;
+    Property TestCodes As %String; ; store as $ListBuild(...)
     Property RawData As %String;
 
-    /// Converts internal delimiters to ASTM-compliant delimiters
-    ClassMethod ConvertDelimiters(data As %String) As %String
+    ClassMethod ConvertDelimiters(data As %String)
     {
         Set data = $Replace(data, "^imfd", "|")
         Set data = $Replace(data, "^imcd", "^")
         Quit data
     }
 
-    /// Validates order data (no bad dates, no nulls)
-    ClassMethod Validate(order As Lab.Instrument.Order) As %Boolean
+    ClassMethod Validate(order As Lab.Instrument.Order)
     {
         If order.OrderId="" Quit 0
         If order.PatientId="" Quit 0
-        If order.OrderDate'?4N1"-"2N1"-"2N Quit 0 // Simple YYYY-MM-DD check
+        If order.OrderDate'?4N1"-"2N1"-"2N Quit 0
         If order.TestCodes="" Quit 0
         Quit 1
     }
 
-    /// Formats order as ASTM message (Header, Patient, Order segments)
-    ClassMethod FormatASTM(order As Lab.Instrument.Order) As %String
+    ClassMethod FormatASTM(order As Lab.Instrument.Order)
     {
-        // ASTM control characters
-        Set STX = $Char(2), ETX = $Char(3), CR = $Char(13), LF = $Char(10)
-        Set FS = $Char(28), ETB = $Char(23)
-        // Segments
+        Set STX = $Char(2), ETX = $Char(3), CR = $Char(13)
         Set header = "H|\^&|||LIS|||||P|1"
         Set patient = "P|1|"_..ConvertDelimiters(order.PatientId)_"|||||||||||||||||||||||||"
-        // Map all test codes to WASPLab codes (M-type by default)
         Set mappedCodes = ""
-        For i=1:1:$ListLength(order.TestCodes) {
+        Set testCount = $ListLength(order.TestCodes)
+        For i=1:1:testCount {
             Set code = $ListGet(order.TestCodes,i)
             Set waspCode = ..InternalToWasp(code,"M")
             Set mappedCodes = $S(mappedCodes'="":mappedCodes_"^",1:"")_waspCode
@@ -45,20 +39,22 @@ Class Lab.Instrument.Order Extends %Persistent
         Quit msg
     }
 
-    /// Packages one or more orders into ASTM message(s)
-    ClassMethod PackageOrders(orderList As %ListOfObjects, mode As %String = "SINGLE") As %String
+    ClassMethod PackageOrders(orderList As %String, mode As %String)
     {
         Set result = ""
+        Set count = $ListLength(orderList)
         If mode="SINGLE" {
-            For i=1:1:$ListLength(orderList) {
-                Set order = $ListGet(orderList,i)
+            For i=1:1:count {
+                Set orderId = $ListGet(orderList,i)
+                Set order = ..%OpenId(orderId)
                 Set msg = ..FormatASTM(order)
                 Set result = result_msg
             }
         } ElseIf mode="MULTIPLE" {
             Set msg = ""
-            For i=1:1:$ListLength(orderList) {
-                Set order = $ListGet(orderList,i)
+            For i=1:1:count {
+                Set orderId = $ListGet(orderList,i)
+                Set order = ..%OpenId(orderId)
                 Set msg = msg_..FormatASTM(order)
             }
             Set result = msg
@@ -66,67 +62,50 @@ Class Lab.Instrument.Order Extends %Persistent
         Quit result
     }
 
-    /// Stores order in pending orders database
     ClassMethod StorePending(order As Lab.Instrument.Order)
     {
         Do order.%Save()
     }
 
-    /// Transmits orders in response to analyzer query
-    ClassMethod TransmitPendingOrders(mode As %String = "SINGLE")
+    ClassMethod TransmitPendingOrders(mode As %String)
     {
-        // Fetch all pending orders
-        Set orderList = ##class(%ListOfObjects).%New()
+        Set orderList = ""
         Set id=""
         For  Set id=$Order(^Lab.Instrument.OrderD(id)) Quit:id=""  {
             Set order = ##class(Lab.Instrument.Order).%OpenId(id)
             If ..Validate(order) {
-                Do orderList.Insert(order)
+                Set orderList = orderList_$ListBuild(order.%Id())
             }
         }
-        If orderList.Count()=0 Quit
+        If orderList="" Quit
         Set msg = ..PackageOrders(orderList,mode)
-        // Send via connection
         Set conn = ##class(Lab.Instrument.Connection).%New()
         If conn.IsConnected() {
             Do conn.Socket.Write(msg)
-            // Optionally mark as sent or remove from pending
         }
     }
 
-    /// Receives and parses ASTM result messages from WASP subsystem
     ClassMethod ReceiveAndParseResults()
     {
-        // Assume connection is already established and socket is available
         Set conn = ##class(Lab.Instrument.Connection).%New()
         If 'conn.IsConnected() Quit
 
-        // Read incoming ASTM message (blocking read for demonstration)
         Set msg = ""
-        Try {
-            Set msg = conn.Socket.Read()
-        } Catch ex {
-            Do ..LogParse("Error reading from socket: "_ex.DisplayString())
-            Quit
-        }
+        Set msg = conn.Socket.Read()
         If msg="" Quit
 
-        // Log the raw message
         Do ..LogParse("Received message: "_msg)
 
-        // Handle ASTM control characters
         Set STX = $Char(2), ETX = $Char(3), CR = $Char(13), LF = $Char(10), FS = $Char(28)
         Set msg = $ZStrip(msg, "<W", STX_ETX_CR_LF_FS)
 
-        // Split into segments by CR
         Set segCount = $Length(msg, CR)
         For segIdx=1:1:segCount {
             Set segment = $Piece(msg, CR, segIdx)
-            If segment="" Continue
+            If segment="" Quit
 
             Set segType = $Piece(segment, "|", 1)
             If segType="H" {
-                // Header: check sender
                 Set sender = $Piece(segment, "|", 5)
                 If sender'="WASPLAB" {
                     Do ..LogParse("Ignored message from sender: "_sender)
@@ -134,15 +113,13 @@ Class Lab.Instrument.Order Extends %Persistent
                 }
             }
             ElseIf segType="O" {
-                // Order segment: parse order ID, etc.
                 Set orderId = $Piece(segment, "|", 3)
                 Set orderDate = ..ParseASTMDate($Piece(segment, "|", 15))
-                Set patientId = "" // May be in P segment
+                Set patientId = ""
                 Set currentOrder = orderId
                 Set ^ParsedResults(currentOrder,"OrderDate") = orderDate
             }
             ElseIf segType="R" {
-                // Result segment: parse result fields
                 Set waspCode = $Piece($Piece(segment, "|", 3), "^", 1)
                 Set testCode = ..WaspToInternal(waspCode,"M")
                 Set resultValue = $Piece(segment, "|", 4)
@@ -153,16 +130,12 @@ Class Lab.Instrument.Order Extends %Persistent
                 Set ^ParsedResults(currentOrder,"Results",testCode,"Time") = resultTime
             }
             ElseIf segType="L" {
-                // Trailer segment: end of message
                 Do ..LogParse("Trailer segment processed.")
             }
-            // Optionally handle Patient (P) and other segments as needed
         }
 
-        // Transform parsed data to internal format (example: move to LIS structure)
         Set order=""
         For  Set order=$Order(^ParsedResults(order)) Quit:order=""  {
-            // Example transformation: store in ^LISResults global
             Set test=""
             For  Set test=$Order(^ParsedResults(order,"Results",test)) Quit:test=""  {
                 Set value = ^ParsedResults(order,"Results",test,"Value")
@@ -176,8 +149,7 @@ Class Lab.Instrument.Order Extends %Persistent
         Do ..LogParse("Parsed and transformed results for orders.")
     }
 
-    /// Helper: Parse ASTM date (YYYYMMDD) to internal format (YYYY-MM-DD)
-    ClassMethod ParseASTMDate(astmDate As %String) As %String
+    ClassMethod ParseASTMDate(astmDate As %String)
     {
         If astmDate?8N {
             Quit $Extract(astmDate,1,4)_"-"_$Extract(astmDate,5,2)_"-"_$Extract(astmDate,7,2)
@@ -185,8 +157,7 @@ Class Lab.Instrument.Order Extends %Persistent
         Quit ""
     }
 
-    /// Helper: Parse ASTM time (HHMMSS) to internal format (HH:MM:SS)
-    ClassMethod ParseASTMTime(astmTime As %String) As %String
+    ClassMethod ParseASTMTime(astmTime As %String)
     {
         If astmTime?6N {
             Quit $Extract(astmTime,1,2)_":"_$Extract(astmTime,3,2)_":"_$Extract(astmTime,5,2)
@@ -194,43 +165,37 @@ Class Lab.Instrument.Order Extends %Persistent
         Quit ""
     }
 
-    /// Log parsing activities for troubleshooting and audit
     ClassMethod LogParse(msg As %String)
     {
         Set ^LabInstrumentParseLog($Increment(^LabInstrumentParseLog)) = $ZDATETIME($H,3)_" "_msg
     }
 
-    /// Pending order management configuration
-    ClassMethod GetOrderDBConfig() As %DynamicObject
+    ClassMethod GetOrderDBConfig()
     {
-        // Example config: can be loaded from persistent config class or global
-        Set config = ##class(%DynamicObject).%New()
-        Set config.RetentionDays = 7
-        Set config.SpecimenPadChar = "0"
-        Set config.SpecimenSigDigits = 8
-        Set config.SpecimenStripLeadingZeroes = 1
-        Set config.OnDuplicateAction = "Overwrite" // or "Append"
-        Quit config
+        Set config("RetentionDays") = $Get(^OrderDBConfig("RetentionDays"),7)
+        Set config("SpecimenPadChar") = $Get(^OrderDBConfig("SpecimenPadChar"),"0")
+        Set config("SpecimenSigDigits") = $Get(^OrderDBConfig("SpecimenSigDigits"),8)
+        Set config("SpecimenStripLeadingZeroes") = $Get(^OrderDBConfig("SpecimenStripLeadingZeroes"),1)
+        Set config("OnDuplicateAction") = $Get(^OrderDBConfig("OnDuplicateAction"),"Overwrite")
+        Quit $Name(config)
     }
 
-    /// Format Specimen ID according to configuration
-    ClassMethod FormatSpecimenID(specimenId As %String) As %String
+    ClassMethod FormatSpecimenID(specimenId As %String)
     {
-        Set config = ..GetOrderDBConfig()
+        Set configRef = ..GetOrderDBConfig()
         Set id = specimenId
-        If config.SpecimenStripLeadingZeroes {
+        If @configRef@("SpecimenStripLeadingZeroes") {
             Set id = +id
         }
-        Set id = $Justify(id,config.SpecimenSigDigits,config.SpecimenPadChar)
+        Set id = $Justify(id,@configRef@("SpecimenSigDigits"),@configRef@("SpecimenPadChar"))
         Quit id
     }
 
-    /// Store or update a pending order (handles Overwrite/Append)
     ClassMethod StoreOrUpdatePendingOrder(order As Lab.Instrument.Order)
     {
-        Set config = ..GetOrderDBConfig()
+        Set configRef = ..GetOrderDBConfig()
         Set specimenId = ..FormatSpecimenID(order.OrderId)
-        Set action = config.OnDuplicateAction
+        Set action = @configRef@("OnDuplicateAction")
         If $Data(^PendingOrders(specimenId)) {
             If action="Overwrite" {
                 Kill ^PendingOrders(specimenId)
@@ -245,32 +210,28 @@ Class Lab.Instrument.Order Extends %Persistent
         }
     }
 
-    /// Remove tests/orders when analyzer queries for orders
     ClassMethod RemoveOnQuery(specimenId As %String)
     {
         Set specimenId = ..FormatSpecimenID(specimenId)
         Kill ^PendingOrders(specimenId)
     }
 
-    /// Remove tests/orders when analyzer transmits results
     ClassMethod RemoveOnResult(specimenId As %String)
     {
         Set specimenId = ..FormatSpecimenID(specimenId)
         Kill ^PendingOrders(specimenId)
     }
 
-    /// Remove tests/orders when cancel messages are processed
     ClassMethod RemoveOnCancel(specimenId As %String)
     {
         Set specimenId = ..FormatSpecimenID(specimenId)
         Kill ^PendingOrders(specimenId)
     }
 
-    /// Purge orders older than retention policy
     ClassMethod PurgeOldOrders()
     {
-        Set config = ..GetOrderDBConfig()
-        Set cutoff = $H - config.RetentionDays
+        Set configRef = ..GetOrderDBConfig()
+        Set cutoff = $H - @configRef@("RetentionDays")
         Set id=""
         For  Set id=$Order(^PendingOrders(id)) Quit:id=""  {
             Set orderList = ^PendingOrders(id)
@@ -284,22 +245,18 @@ Class Lab.Instrument.Order Extends %Persistent
         }
     }
 
-    /// UI method: configure default action for duplicate specimen IDs
     ClassMethod SetDuplicateAction(action As %String)
     {
-        // action: "Overwrite" or "Append"
         Set ^OrderDBConfig("OnDuplicateAction") = action
     }
 
-    /// UI method: configure specimen formatting
-    ClassMethod SetSpecimenFormat(stripZeroes As %Boolean, sigDigits As %Integer, padChar As %String)
+    ClassMethod SetSpecimenFormat(stripZeroes, sigDigits, padChar)
     {
         Set ^OrderDBConfig("SpecimenStripLeadingZeroes") = stripZeroes
         Set ^OrderDBConfig("SpecimenSigDigits") = sigDigits
         Set ^OrderDBConfig("SpecimenPadChar") = padChar
     }
 
-    /// UI method: get current config
     ClassMethod ShowOrderDBConfig()
     {
         Write "RetentionDays: ", $Get(^OrderDBConfig("RetentionDays"),7), !
@@ -313,7 +270,7 @@ Class Lab.Instrument.Order Extends %Persistent
     ///                         : ^TestCodeMap("wasp",waspCode,type)=internalCode
 
     /// Add or update a test code mapping (with validation and logging)
-    ClassMethod AddTestCodeMapping(internalCode As %String, waspCode As %String, type As %String, user As %String) As %Status
+    ClassMethod AddTestCodeMapping(internalCode As %String, waspCode As %String, type As %String, user As %String)
     {
         // type: "M", "G", or "W"
         If (internalCode="")!(waspCode="") Quit $$$ERROR
@@ -390,10 +347,8 @@ Class Lab.Instrument.Order Extends %Persistent
         }
     }
 
-    // --- Integration with order transmission and result parsing ---
-
     /// Override: FormatASTM to use mapped WASPLab codes
-    ClassMethod FormatASTM(order As Lab.Instrument.Order) As %String
+    ClassMethod FormatASTM(order As Lab.Instrument.Order)
     {
         Set STX = $Char(2), ETX = $Char(3), CR = $Char(13)
         Set header = "H|\^&|||LIS|||||P|1"
@@ -791,5 +746,4 @@ Class Lab.Instrument.Order Extends %Persistent
         Set ^LabInstrumentTrace($Increment(^LabInstrumentTrace)) = "ERROR|" _ $ZDATETIME($H,3) _ "|" _ msg
     }
 
-    // ...existing code...
 }
