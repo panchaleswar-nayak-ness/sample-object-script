@@ -1,79 +1,68 @@
 Class Lab.Instrument.Connection Extends %RegisteredObject
 {
-    Property Status As %String [ Private ];
-    Property Socket As %Stream.TCP [ Private ];
-    Property Config As Lab.Instrument.Config [ Private ];
-
-    Method %OnNew()
+    ClassMethod Connect()
     {
-        Set ..Config = ##class(Lab.Instrument.Config).GetConfig()
-        Set ..Status = "Disconnected"
-    }
-
-    Method Connect() As %Status
-    {
-        Set config = ..Config
+        Set config = ##class(Lab.Instrument.Config).GetConfig()
         Set retry = 0
         For  {
-            Try {
-                Set sock = ##class(%Stream.TCP).%New()
-                Do sock.Connect(config.IPAddress, config.Port)
-                Set ..Socket = sock
-                Set ..Status = "Connected"
+            Set sock = ##class(%Library.TCP).%New()
+            Set sc = sock.Connect(config.IPAddress, config.Port)
+            If sc=1 {
+                Set ^LabConn("Socket") = sock
+                Set ^LabConn("Status") = "Connected"
                 Do ..Log("Connected to "_config.IPAddress_":"_config.Port)
-                Quit $$$OK
-            } Catch ex {
+                Quit
+            } Else {
                 Set retry = retry + 1
-                Set ..Status = "Error: "_ex.DisplayString()
-                Do ..Log("Connection error: "_ex.DisplayString())
+                Set ^LabConn("Status") = "Error: "_$System.Status.GetErrorText(sc)
+                Do ..Log("Connection error: "_$System.Status.GetErrorText(sc))
                 If retry'<config.RetryCount {
                     Do ##class(%SYS.Task).Sleep(config.RetryInterval)
                 } Else {
-                    Quit $$$ERROR
+                    Quit
                 }
             }
         }
     }
 
-    Method Disconnect()
+    ClassMethod Disconnect()
     {
-        If $IsObject(..Socket) {
-            Do ..Socket.Close()
-            Set ..Status = "Disconnected"
+        If $IsObject(^LabConn("Socket")) {
+            Do ^LabConn("Socket").Close()
+            Set ^LabConn("Status") = "Disconnected"
             Do ..Log("Disconnected")
         }
     }
 
-    Method GetStatus() As %String
+    ClassMethod GetStatus()
     {
-        Quit ..Status
+        Quit ^LabConn("Status")
     }
 
-    Method ManualConnect()
+    ClassMethod ManualConnect()
     {
         Do ..Connect()
     }
 
-    Method ManualDisconnect()
+    ClassMethod ManualDisconnect()
     {
         Do ..Disconnect()
     }
 
     Method Log(msg As %String)
     {
-        // Simple logging to ^LabInstrumentLog global
         Set ^LabInstrumentLog($Increment(^LabInstrumentLog)) = $ZDATETIME($H,3)_" "_msg
     }
 
     Method HandleDisruption()
     {
-        Set ..Status = "Connection lost. Attempting reconnect..."
-        Do ..Log(..Status)
+        Set ^LabConn("Status") = "Connection lost. Attempting reconnect..."
+        Do ..Log(^LabConn("Status"))
         Do ..Connect()
     }
 
-    Method IsConnected() As %Boolean
+    ClassMethod IsConnected()
     {
-        Quit (..Status = "Connected")
+        Quit (^LabConn("Status") = "Connected")
     }
 }
